@@ -7,3 +7,9 @@ build
 .svace-dir
 cov-int
 /MacKernelSDK
+# Local Pi runtime state
+.atl/
+WorkAround.md
+collect_ionvmefamily_24e263.sh
+local-artifacts/
+odd/

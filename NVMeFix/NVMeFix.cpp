@@ -56,9 +56,30 @@ void NVMeFixPlugin::processKext(void* that, KernelPatcher& patcher, size_t index
 	}
 }
 
+bool NVMeFixPlugin::checkForInterruptWorkAround(void* controller, unsigned int vendor,
+												unsigned int device) {
+	auto& plugin = globalPlugin();
+	auto original = plugin.kextFuncs.IONVMeController.CheckForInterruptWorkAround(controller,
+																				 vendor, device);
+
+	if (vendor == 0x144d && device == 0xa808) {
+		if (!atomic_exchange_explicit(&plugin.pm981aInterruptWorkaroundLogged, true,
+										 memory_order_relaxed))
+			SYSLOG(Log::Plugin, "Activating experimental PM981a interrupt workaround for 144d:a808");
+		return true;
+	}
+
+	return original;
+}
+
 bool NVMeFixPlugin::solveSymbols(KernelPatcher& kp) {
 	auto idx = plugin.kextInfo.loadIndex;
 	bool res = true;
+
+	if (getKernelVersion() == KernelVersion::Sequoia &&
+		!kextFuncs.IONVMeController.CheckForInterruptWorkAround.route(
+			kp, idx, checkForInterruptWorkAround))
+		SYSLOG(Log::Plugin, "PM981a experimental interrupt workaround unavailable");
 	res &= (kextFuncs.IONVMeController.IssueIdentifyCommandNew.solve(kp, idx) ||
 			kextFuncs.IONVMeController.IssueIdentifyCommand.solve(kp, idx)) &&
 	kextFuncs.IONVMeController.ProcessSyncNVMeRequest.solve(kp, idx) &&
