@@ -44,10 +44,8 @@ private:
 	static bool matchingNotificationHandler(void*, void*, IOService*, IONotifier*);
 	static bool terminatedNotificationHandler(void*, void*, IOService*, IONotifier*);
 	bool solveSymbols(KernelPatcher& kp);
-	static bool checkForInterruptWorkAround(void*, unsigned int, unsigned int);
 
 	atomic_bool solvedSymbols = false;
-	atomic_bool pm981aInterruptWorkaroundLogged = false;
 
 	IONotifier* matchingNotifier {nullptr}, * terminationNotifier {nullptr};
 
@@ -135,9 +133,6 @@ private:
 			Func<bool,void*,unsigned long, unsigned long> activityTickle {};
 			Func<void,void*,void*,int> FilterInterruptRequest {
 				"__ZN16IONVMeController22FilterInterruptRequestEP28IOFilterInterruptEventSource"
-			};
-			Func<bool,void*,unsigned int,unsigned int> CheckForInterruptWorkAround {
-				"__ZN16IONVMeController27CheckForInterruptWorkAroundEjj"
 			};
 		} IONVMeController;
 
