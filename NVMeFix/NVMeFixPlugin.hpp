@@ -17,12 +17,14 @@
 #define NVMeFixPlugin_h
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
+#include <Headers/kern_nvram.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 
@@ -44,8 +46,20 @@ private:
 	static bool matchingNotificationHandler(void*, void*, IOService*, IONotifier*);
 	static bool terminatedNotificationHandler(void*, void*, IOService*, IONotifier*);
 	bool solveSymbols(KernelPatcher& kp);
+	bool solveAndRouteDiagnostics(KernelPatcher& kp, mach_vm_address_t imageAddress, size_t imageSize);
+	bool validateDiagnosticABI(mach_vm_address_t imageAddress, size_t imageSize) const;
+	bool verifyDiagnosticImage(mach_vm_address_t imageAddress, size_t imageSize) const;
+
+	static void submitCommandWrapper(void*, void*, void*);
+	static bool filterInterruptRequestWrapper(void*, void*);
+	static void handleInterruptRequestWrapper(void*, void*, int);
+	static bool processCompletionQueueWrapper(void*, void*);
+	static void commandTimeoutWrapper(void*, void*);
 
 	atomic_bool solvedSymbols = false;
+	atomic_bool diagnosticImageValid = false;
+	atomic_bool diagnosticRoutesReady = false;
+	atomic_uint diagnosticHookMask = 0;
 
 	IONotifier* matchingNotifier {nullptr}, * terminationNotifier {nullptr};
 
@@ -131,8 +145,20 @@ private:
 				"__ZN16IONVMeController13ReturnRequestEP16AppleNVMeRequest"
 			};
 			Func<bool,void*,unsigned long, unsigned long> activityTickle {};
-			Func<void,void*,void*,int> FilterInterruptRequest {
+			Func<void,void*,void*,void*> SubmitCommand {
+				"__ZN16IONVMeController13SubmitCommandEP24AppleNVMeSubmissionQueueP16AppleNVMeRequest"
+			};
+			Func<bool,void*,void*> FilterInterruptRequest {
 				"__ZN16IONVMeController22FilterInterruptRequestEP28IOFilterInterruptEventSource"
+			};
+			Func<void,void*,void*,int> HandleInterruptRequest {
+				"__ZN16IONVMeController22HandleInterruptRequestEP22IOInterruptEventSourcei"
+			};
+			Func<bool,void*,void*> ProcessCompletionQueue {
+				"__ZN16IONVMeController22ProcessCompletionQueueEP24AppleNVMeCompletionQueue"
+			};
+			Func<void,void*,void*> CommandTimeout {
+				"__ZN16IONVMeController14CommandTimeoutEP16AppleNVMeRequest"
 			};
 		} IONVMeController;
 
@@ -278,10 +304,114 @@ private:
 		}
 	};
 
+	enum DiagnosticHook : uint32_t {
+		HookSubmitCommand = 1U << 0,
+		HookFilterInterruptRequest = 1U << 1,
+		HookHandleInterruptRequest = 1U << 2,
+		HookProcessCompletionQueue = 1U << 3,
+		HookCommandTimeout = 1U << 4
+	};
+
+	enum class SnapshotMode : uint8_t {
+		PersistenceTest = 1,
+		CommandTimeout = 2
+	};
+
+	enum SnapshotFlag : uint32_t {
+		SnapshotExactImage = 1U << 0,
+		SnapshotExactTarget = 1U << 1,
+		SnapshotStorageReady = 1U << 2,
+		SnapshotExistingKeyAbsent = 1U << 3
+	};
+
+	enum class SnapshotOutcome : uint8_t {
+		NotAttempted = 0,
+		SucceededIfPresent = 1,
+		AttemptedResultNotPersisted = 2
+	};
+
+	struct PACKED DiagnosticSnapshot {
+		uint32_t magic;
+		uint16_t schemaVersion;
+		uint16_t size;
+		uint8_t mode;
+		uint8_t writeOutcome;
+		uint8_t syncOutcome;
+		uint8_t reserved0;
+		uint32_t flags;
+		uint32_t hookMask;
+		uint8_t ionvmeUUID[16];
+		uint16_t pciVendor;
+		uint16_t pciDevice;
+		char model[41];
+		char firmware[9];
+		uint8_t opcode;
+		uint8_t reserved1;
+		uint16_t commandID;
+		uint32_t namespaceID;
+		uint64_t submissions;
+		uint64_t readSubmissions;
+		uint64_t writeSubmissions;
+		uint64_t flushSubmissions;
+		uint64_t filterCalls;
+		uint64_t filterAccepted;
+		uint64_t handlerCalls;
+		uint64_t completionQueueCalls;
+		uint64_t completionQueueWork;
+		uint64_t commandTimeouts;
+		uint64_t lastSubmitTime;
+		uint64_t lastFilterTime;
+		uint64_t lastHandlerTime;
+		uint64_t lastCompletionQueueTime;
+		uint64_t lastCommandTimeoutTime;
+		uint32_t crc32;
+	};
+
+	static_assert(sizeof(DiagnosticSnapshot) == 222, "PM981a diagnostic snapshot layout changed");
+	static_assert(sizeof(DiagnosticSnapshot) <= 512, "PM981a diagnostic snapshot exceeds 512 bytes");
+	static_assert(offsetof(DiagnosticSnapshot, crc32) == 218,
+		"PM981a diagnostic CRC offset changed");
+	static_assert(offsetof(DiagnosticSnapshot, crc32) + sizeof(uint32_t) == sizeof(DiagnosticSnapshot),
+		"PM981a diagnostic CRC must be the final field");
+
+	bool persistenceTestRequested {false};
+	static constexpr size_t terminatedControllerSlots {8};
+	bool runtimeDiagnosticsRequested {false};
+	atomic_uintptr_t armedController = 0;
+	atomic_uintptr_t terminatedControllers[terminatedControllerSlots] {};
+	atomic_bool terminatedControllerOverflow = false;
+	atomic_uint storageState = 0;
+	atomic_bool nvramWriteAttempted = false;
+	NVStorage diagnosticStorage;
+
+	atomic_uint_fast64_t submissions = 0;
+	atomic_uint_fast64_t readSubmissions = 0;
+	atomic_uint_fast64_t writeSubmissions = 0;
+	atomic_uint_fast64_t flushSubmissions = 0;
+	atomic_uint_fast64_t filterCalls = 0;
+	atomic_uint_fast64_t filterAccepted = 0;
+	atomic_uint_fast64_t handlerCalls = 0;
+	atomic_uint_fast64_t completionQueueCalls = 0;
+	atomic_uint_fast64_t completionQueueWork = 0;
+	atomic_uint_fast64_t commandTimeouts = 0;
+	atomic_uint_fast64_t lastSubmitTime = 0;
+	atomic_uint_fast64_t lastFilterTime = 0;
+	atomic_uint_fast64_t lastHandlerTime = 0;
+	atomic_uint_fast64_t lastCompletionQueueTime = 0;
+	atomic_uint_fast64_t lastCommandTimeoutTime = 0;
+
 	evector<ControllerEntry*, ControllerEntry::deleter> controllers;
 	void handleControllers();
 	void forceEnableASPM(IOService*);
 	void handleController(ControllerEntry&);
+	void handlePM981aDiagnostics(ControllerEntry&, const NVMe::nvme_id_ctrl*);
+	bool controllerIsTerminating(uintptr_t);
+	void recordTerminatingController(uintptr_t);
+	bool prepareDiagnosticStorage();
+	void persistDiagnosticSnapshot(SnapshotMode, void* request=nullptr);
+	static bool copyTrimmedIdentifyField(char* destination, size_t destinationSize,
+		const char* source, size_t sourceSize);
+	static uint32_t diagnosticCRC32(const uint8_t* data, size_t size);
 	IOReturn identify(ControllerEntry&,IOBufferMemoryDescriptor*&);
 	bool enableAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*);
 	IOReturn configureAPST(ControllerEntry&,const NVMe::nvme_id_ctrl*);
